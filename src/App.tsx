@@ -1,222 +1,563 @@
-import React, { useState, useEffect } from 'react';
-import { Character, DebateResult, GenerateDebateRequest } from './types/debate';
-import { PRESET_CHARACTERS, validateDebateRequest, generateDeterministicDebate } from './utils/debateLogic';
-import { Navbar } from './components/Navbar';
-import { DebaterCard } from './components/DebaterCard';
-import { TopicSection } from './components/TopicSection';
-import { CharacterModal } from './components/CharacterModal';
-import { ResearchPipelineModal } from './components/ResearchPipelineModal';
-import { StudioArena } from './components/StudioArena';
-import { Swords, Sparkles, AlertCircle, History, Mic, Volume2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import type { DebateScript, DebateTurn, EnglishEngine, Language, ResearchDossier } from '../shared/types';
+import { defaultVoice, isKnownVoice, PRESETS, voiceChoices } from '../shared/voices';
+import { validateSetup } from '../shared/validate';
+import { AccessError, checkHealth, researchDebater, setAccessKey, synthesizeTurn, writeDebate } from './api';
+
+interface Side {
+  name: string;
+  note: string;
+  voiceId: string;
+}
+
+const FORM_KEY = 'debate-form-v1';
 
 export default function App() {
-  const [character1, setCharacter1] = useState<Character>(PRESET_CHARACTERS[0]); // Socrates
-  const [character2, setCharacter2] = useState<Character>(PRESET_CHARACTERS[1]); // Nietzsche
-  const [topic, setTopic] = useState('جبر یا اختیار: آیا انسان واقعاً مختار است یا زندانیِ ژنتیک و شرایط؟');
-  const [roundsCount, setRoundsCount] = useState<number>(3);
-  const [moderatorEnabled, setModeratorEnabled] = useState<boolean>(true);
-  const [debateTone, setDebateTone] = useState<string>('پرحرارت، مستدل و کوبنده');
+  const stored = useMemo(readForm, []);
+  const [language, setLanguage] = useState<Language>(stored?.language ?? 'fa');
+  const [engine, setEngine] = useState<EnglishEngine>(stored?.engine ?? 'kokoro');
+  const [rounds, setRounds] = useState(stored?.rounds ?? 3);
+  const [topic, setTopic] = useState(stored?.topic ?? 'آیا انسان در عمل مختار است، یا انتخابش از قبل شکل گرفته؟');
+  const [a, setA] = useState<Side>(stored?.a ?? sideFromPreset('socrates', 'fa', 'kokoro'));
+  const [b, setB] = useState<Side>(stored?.b ?? sideFromPreset('nietzsche', 'fa', 'kokoro'));
+  const [dossierA, setDossierA] = useState<ResearchDossier | null>(null);
+  const [dossierB, setDossierB] = useState<ResearchDossier | null>(null);
+  const [script, setScript] = useState<DebateScript | null>(null);
+  const [audio, setAudio] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+  const [needsKey, setNeedsKey] = useState(false);
+  const [accessDraft, setAccessDraft] = useState('');
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const stopRef = useRef(false);
+  const resultRef = useRef<HTMLElement | null>(null);
 
-  const [isLoading, setIsLoading] = useState(false);
-  const [debateResult, setDebateResult] = useState<DebateResult | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-  // Character selector modal state
-  const [modalTarget, setModalTarget] = useState<'char1' | 'char2' | null>(null);
-
-  // Handle autostart query parameter for testing
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('autostart') === '1') {
-      handleStartDebate();
-    }
+    sessionStorage.setItem(FORM_KEY, JSON.stringify({ language, engine, rounds, topic, a, b }));
+  }, [language, engine, rounds, topic, a, b]);
+
+  useEffect(() => {
+    checkHealth()
+      .then(() => setNeedsKey(false))
+      .catch((caught) => {
+        if (caught instanceof AccessError) setNeedsKey(true);
+      });
+    return () => {
+      audioRef.current?.pause();
+    };
   }, []);
 
-  const handleSelectQuickMatchup = (char1Id: string, char2Id: string, quickTopic: string) => {
-    const c1 = PRESET_CHARACTERS.find((c) => c.id === char1Id);
-    const c2 = PRESET_CHARACTERS.find((c) => c.id === char2Id);
-    if (c1) setCharacter1(c1);
-    if (c2) setCharacter2(c2);
-    setTopic(quickTopic);
-    setDebateResult(null);
-  };
+  const voices = voiceChoices(language, engine);
 
-  const handleStartDebate = async () => {
-    setErrorMessage(null);
+  function updateSide(current: Side, next: Side, apply: (side: Side) => void) {
+    const contentChanged = next.name !== current.name || next.note !== current.note;
+    apply(next);
+    if (contentChanged) clearWork();
+    else if (next.voiceId !== current.voiceId) clearAudio();
+  }
 
-    const validation = validateDebateRequest({
-      character1,
-      character2,
-      topic,
-    });
+  function changeLanguage(next: Language) {
+    setLanguage(next);
+    setA((side) => localizeSide(side, language, next, 'a', engine));
+    setB((side) => localizeSide(side, language, next, 'b', engine));
+    clearWork();
+  }
 
-    if (!validation.valid) {
-      setErrorMessage(validation.error || 'اطلاعات ناقص است.');
+  function changeEngine(next: EnglishEngine) {
+    setEngine(next);
+    setA((side) => withVoice(side, language, 'a', next));
+    setB((side) => withVoice(side, language, 'b', next));
+    clearAudio();
+  }
+
+  function clearAudio() {
+    stopPlayback();
+    setAudio({});
+  }
+
+  function clearScript() {
+    setScript(null);
+    clearAudio();
+  }
+
+  function clearWork() {
+    setDossierA(null);
+    setDossierB(null);
+    clearScript();
+  }
+
+  async function saveAccess(event: FormEvent) {
+    event.preventDefault();
+    setAccessKey(accessDraft);
+    setError('');
+    try {
+      await checkHealth();
+      setNeedsKey(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'کلید پذیرفته نشد.');
+    }
+  }
+
+  async function start() {
+    const validation = validateSetup({ language, topic, rounds, engine, a, b });
+    if (!validation.ok) {
+      setError(validation.error || 'اطلاعات ناقص است.');
       return;
     }
 
-    setIsLoading(true);
+    stopPlayback();
+    setBusy(true);
+    setError('');
+    setScript(null);
+    setAudio({});
 
     try {
-      const payload: GenerateDebateRequest = {
-        character1,
-        character2,
-        topic,
-        roundsCount,
-        moderatorEnabled,
-        debateTone,
-      };
+      let left = dossierA;
+      let right = dossierB;
 
-      // Call backend API
-      const resp = await fetch('/api/debate/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (!resp.ok) {
-        throw new Error('خطا در ارتباط با سرور هوش مصنوعی');
+      if (!left || !right) {
+        setStatus('تحقیق هر طرف، جدا از هم');
+        const tasks: Promise<unknown>[] = [];
+        if (!left) {
+          tasks.push(
+            researchDebater({
+              name: a.name.trim(),
+              note: a.note.trim(),
+              topic: topic.trim(),
+              opponentName: b.name.trim(),
+              language,
+            }).then((value) => {
+              left = value;
+              setDossierA(value);
+            }),
+          );
+        }
+        if (!right) {
+          tasks.push(
+            researchDebater({
+              name: b.name.trim(),
+              note: b.note.trim(),
+              topic: topic.trim(),
+              opponentName: a.name.trim(),
+              language,
+            }).then((value) => {
+              right = value;
+              setDossierB(value);
+            }),
+          );
+        }
+        const settled = await Promise.allSettled(tasks);
+        const failed = settled.find((item) => item.status === 'rejected') as PromiseRejectedResult | undefined;
+        if (!left || !right) {
+          throw new Error(messageOf(failed?.reason) || 'تحقیق یکی از دو طرف انجام نشد.');
+        }
       }
 
-      const data: DebateResult = await resp.json();
-
-      // Pre-synthesize the first turn audio if possible in background
-      setDebateResult(data);
-    } catch (err: any) {
-      console.warn('API call failed, generating deterministic fallback:', err);
-      // Fallback to deterministic full debate generator
-      const fallback = generateDeterministicDebate({
-        character1,
-        character2,
-        topic,
-        roundsCount,
-        moderatorEnabled,
-        debateTone,
+      setStatus('نوشتن مناظره از روی دو پرونده');
+      const nextScript = await writeDebate({
+        language,
+        topic: topic.trim(),
+        rounds,
+        speakerA: { name: a.name.trim(), note: a.note.trim() },
+        speakerB: { name: b.name.trim(), note: b.note.trim() },
+        researchA: left,
+        researchB: right,
       });
-      setDebateResult(fallback);
+      setScript(nextScript);
+      setStatus('');
+      resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (caught) {
+      if (caught instanceof AccessError) setNeedsKey(true);
+      setError(caught instanceof Error ? caught.message : 'ساخت مناظره ناموفق بود.');
+      setStatus('');
     } finally {
-      setIsLoading(false);
+      setBusy(false);
     }
-  };
+  }
+
+  async function ensureAudio(turn: DebateTurn): Promise<string> {
+    const cached = audio[turn.id];
+    if (cached) return cached;
+    const side = turn.speaker === 'a' ? a : b;
+    const result = await synthesizeTurn({
+      text: turn.text,
+      language,
+      voiceId: side.voiceId,
+      delivery: turn.delivery,
+      engine,
+    });
+    setAudio((current) => ({ ...current, [turn.id]: result.audioBase64 }));
+    return result.audioBase64;
+  }
+
+  async function playTurn(turn: DebateTurn) {
+    stopRef.current = false;
+    setError('');
+    try {
+      setStatus('ساخت صدا');
+      const clip = await ensureAudio(turn);
+      if (stopRef.current) return;
+      setStatus('');
+      await playClip(clip, turn.id);
+    } catch (caught) {
+      if (caught instanceof AccessError) setNeedsKey(true);
+      setError(caught instanceof Error ? caught.message : 'صدا ساخته نشد.');
+      setStatus('');
+    }
+  }
+
+  async function playAll() {
+    if (!script) return;
+    stopRef.current = false;
+    setError('');
+    try {
+      for (const turn of script.turns) {
+        if (stopRef.current) break;
+        setStatus(`صدای ${turn.speakerName}`);
+        const clip = await ensureAudio(turn);
+        if (stopRef.current) break;
+        await playClip(clip, turn.id);
+      }
+    } catch (caught) {
+      if (caught instanceof AccessError) setNeedsKey(true);
+      setError(caught instanceof Error ? caught.message : 'پخش کامل ناموفق بود.');
+    } finally {
+      setStatus('');
+      setPlayingId(null);
+    }
+  }
+
+  function playClip(base64: string, id: string): Promise<void> {
+    audioRef.current?.pause();
+    const element = new Audio(`data:audio/mpeg;base64,${base64}`);
+    audioRef.current = element;
+    setPlayingId(id);
+    return new Promise((resolve, reject) => {
+      element.onended = () => {
+        if (audioRef.current === element) setPlayingId(null);
+        resolve();
+      };
+      element.onerror = () => reject(new Error('پخش این قطعه ناموفق بود.'));
+      element.play().catch(() => reject(new Error('مرورگر پخش صدا را مسدود کرد.')));
+    });
+  }
+
+  function stopPlayback() {
+    stopRef.current = true;
+    audioRef.current?.pause();
+    audioRef.current = null;
+    setPlayingId(null);
+  }
+
+  function download(turn: DebateTurn) {
+    const clip = audio[turn.id];
+    if (!clip) return;
+    const link = document.createElement('a');
+    link.href = `data:audio/mpeg;base64,${clip}`;
+    link.download = `${turn.speakerName}-${turn.id}.mp3`;
+    link.click();
+  }
+
+  async function copyTranscript() {
+    if (!script) return;
+    const lines = [`${topic.trim()}`, '', script.premise, ''];
+    for (const turn of script.turns) lines.push(turn.speakerName, turn.text, '');
+    await navigator.clipboard.writeText(lines.join('\n'));
+    setStatus('متن کپی شد');
+    window.setTimeout(() => setStatus(''), 1500);
+  }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500 selection:text-slate-950">
-      {/* Top Navigation */}
-      <Navbar
-        onSelectQuickMatchup={handleSelectQuickMatchup}
-        hasDebateHistory={false}
-      />
+    <main className="mx-auto max-w-3xl px-5 py-8">
+      <header className="mb-8">
+        <h1 className="text-2xl font-semibold">مناظره</h1>
+        <p className="mt-2 text-sm leading-7 text-[#5f5a53]">
+          برای هر طرف یک تحقیق جدا انجام می‌شود. بعد از آن، متن طوری نوشته می‌شود که هر نوبت به حرف قبلی جواب بدهد.
+        </p>
+      </header>
 
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
-        {errorMessage && (
-          <div className="mb-6 p-4 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs sm:text-sm flex items-center justify-between animate-in fade-in">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-              <span>{errorMessage}</span>
-            </div>
-            <button
-              onClick={() => setErrorMessage(null)}
-              className="text-xs text-red-400 hover:text-red-200 underline font-bold"
+      {needsKey && (
+        <form onSubmit={saveAccess} className="mb-6 flex gap-2">
+          <input
+            className="field"
+            type="password"
+            value={accessDraft}
+            onChange={(event) => setAccessDraft(event.target.value)}
+            placeholder="کلید دسترسی"
+            autoComplete="off"
+          />
+          <button className="btn btn-primary" type="submit">
+            ورود
+          </button>
+        </form>
+      )}
+
+      <section className="space-y-5">
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" className={`btn ${language === 'fa' ? 'btn-active' : ''}`} onClick={() => changeLanguage('fa')}>
+            فارسی
+          </button>
+          <button type="button" className={`btn ${language === 'en' ? 'btn-active' : ''}`} onClick={() => changeLanguage('en')}>
+            English
+          </button>
+          <label className="ms-auto flex items-center gap-2 text-sm">
+            راند
+            <select
+              className="field w-auto"
+              value={rounds}
+              onChange={(event) => {
+                setRounds(Number(event.target.value));
+                clearScript();
+              }}
             >
-              بستن
+              {[1, 2, 3, 4].map((count) => (
+                <option key={count} value={count}>
+                  {count}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {language === 'en' && (
+          <label className="block text-sm">
+            <span className="mb-1 block text-[#5f5a53]">صدای انگلیسی</span>
+            <select className="field" value={engine} onChange={(event) => changeEngine(event.target.value as EnglishEngine)}>
+              <option value="kokoro">صداهای جدا (Kokoro، هزینه خیلی کم)</option>
+              <option value="fish-free">رایگان (Fish، هر دو طرف یک رنگ صدا)</option>
+            </select>
+          </label>
+        )}
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <SideFields
+            title="طرف اول"
+            side={a}
+            language={language}
+            voices={voices}
+            onChange={(next) => updateSide(a, next, setA)}
+            onPreset={(id) => {
+              setA(sideFromPreset(id, language, engine));
+              clearWork();
+            }}
+          />
+          <SideFields
+            title="طرف دوم"
+            side={b}
+            language={language}
+            voices={voices}
+            onChange={(next) => updateSide(b, next, setB)}
+            onPreset={(id) => {
+              setB(sideFromPreset(id, language, engine));
+              clearWork();
+            }}
+          />
+        </div>
+
+        <label className="block text-sm">
+          <span className="mb-1 block text-[#5f5a53]">موضوع، به زبان همین نسخه</span>
+          <textarea
+            className="field min-h-24 leading-7"
+            dir={language === 'en' ? 'ltr' : 'rtl'}
+            value={topic}
+            onChange={(event) => {
+              setTopic(event.target.value);
+              clearWork();
+            }}
+          />
+        </label>
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => {
+              setA(b);
+              setB(a);
+              clearWork();
+            }}
+          >
+            جابه‌جایی دو طرف
+          </button>
+          <button type="button" className="btn btn-primary" onClick={start} disabled={busy}>
+            {busy ? 'در حال ساخت' : 'ساخت مناظره'}
+          </button>
+        </div>
+
+        {status && <p className="text-sm text-[#5f5a53]">{status}</p>}
+        {error && <p className="text-sm leading-7 wrap-anywhere text-[#8a3b2c]">{error}</p>}
+      </section>
+
+      {(dossierA || dossierB) && (
+        <section className="mt-8 grid gap-3 md:grid-cols-2">
+          <Dossier title={a.name} dossier={dossierA} />
+          <Dossier title={b.name} dossier={dossierB} />
+        </section>
+      )}
+
+      {script && (
+        <section ref={resultRef} className="mt-8" dir={language === 'en' ? 'ltr' : 'rtl'}>
+          {script.premise && <p className="mb-4 text-sm leading-7 text-[#5f5a53]">{script.premise}</p>}
+          <div className="mb-4 flex flex-wrap gap-2">
+            <button type="button" className="btn" onClick={playAll} disabled={busy}>
+              پخش همه
+            </button>
+            <button type="button" className="btn" onClick={stopPlayback}>
+              توقف
+            </button>
+            <button type="button" className="btn" onClick={copyTranscript}>
+              کپی متن
             </button>
           </div>
-        )}
+          <ol className="space-y-4">
+            {script.turns.map((turn, index) => (
+              <li key={turn.id} className={`rounded-lg border bg-white p-4 ${playingId === turn.id ? 'border-[#221f1b]' : 'border-[#e3dfd8]'}`}>
+                <div className="mb-2 flex items-baseline justify-between gap-3">
+                  <h2 className="text-sm font-semibold">
+                    {index + 1}. {turn.speakerName}
+                  </h2>
+                  <span className="text-xs text-[#8a847b]">{turn.move}</span>
+                </div>
+                <p className="leading-8">{turn.text}</p>
+                <div className="mt-3 flex gap-2">
+                  <button type="button" className="btn" onClick={() => playTurn(turn)}>
+                    {playingId === turn.id ? 'در حال پخش' : audio[turn.id] ? 'پخش' : 'ساخت صدا و پخش'}
+                  </button>
+                  <button type="button" className="btn" onClick={() => download(turn)} disabled={!audio[turn.id]}>
+                    دانلود
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
+    </main>
+  );
+}
 
-        {debateResult ? (
-          /* Live Arena Screen */
-          <StudioArena
-            debate={debateResult}
-            onReset={() => setDebateResult(null)}
-          />
-        ) : (
-          /* Setup Screen: Characters & Single Topic Question */
-          <div className="space-y-8 animate-in fade-in duration-300">
-            {/* Hero Banner */}
-            <div className="text-center max-w-3xl mx-auto pt-2 pb-4">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-bold mb-4">
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>شبیه‌ساز پیشرفته مناظره، پژوهش عمیق و تولید وویس</span>
-              </div>
-              <h1 className="text-2xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight leading-tight sm:leading-snug">
-                طرفین مناظره را برگزینید،
-                <span className="block text-transparent bg-clip-text bg-gradient-to-r from-amber-400 via-amber-300 to-amber-500">
-                  صداها را تنظیم کنید و موضوع را بپرسید
-                </span>
-              </h1>
-              <p className="text-xs sm:text-base text-slate-400 mt-3 leading-relaxed">
-                هوش مصنوعی در پشت صحنه پیرامون افکار هر دو چهره تحقیق کامل می‌کند، پرامپت اختصاصی می‌سازد و مناظره را با صدای زن و مرد شبیه‌سازی و پخش می‌کند.
-              </p>
-            </div>
-
-            {/* Debaters Selection: Left vs Right */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 relative">
-              {/* VS Center Badge */}
-              <div className="hidden md:flex absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 w-12 h-12 rounded-2xl bg-slate-900 border-2 border-amber-500/50 shadow-2xl items-center justify-center font-black text-amber-400 text-sm shadow-amber-500/20">
-                VS
-              </div>
-
-              {/* Debater 1 (Right in RTL) */}
-              <DebaterCard
-                label="طرف اول مناظره"
-                side="left"
-                character={character1}
-                onUpdateCharacter={setCharacter1}
-                onOpenCharacterSelector={() => setModalTarget('char1')}
-              />
-
-              {/* Debater 2 (Left in RTL) */}
-              <DebaterCard
-                label="طرف دوم مناظره"
-                side="right"
-                character={character2}
-                onUpdateCharacter={setCharacter2}
-                onOpenCharacterSelector={() => setModalTarget('char2')}
-              />
-            </div>
-
-            {/* The Topic Question Section ("و فقط یک جا سوال اینو بپرسه که موضوع بحثشون چی باشه") */}
-            <TopicSection
-              topic={topic}
-              onChangeTopic={setTopic}
-              roundsCount={roundsCount}
-              onChangeRoundsCount={setRoundsCount}
-              moderatorEnabled={moderatorEnabled}
-              onToggleModerator={setModeratorEnabled}
-              debateTone={debateTone}
-              onChangeDebateTone={setDebateTone}
-              onStartDebate={handleStartDebate}
-              isLoading={isLoading}
-            />
-          </div>
-        )}
-      </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-6 text-center text-xs text-slate-500">
-        <p>استودیو مناظره هوشمند • مجهز به Gemini AI & TTS Voice Engine • طراحی شده برای کاوش حقیقت</p>
-      </footer>
-
-      {/* Character Selector Modal */}
-      <CharacterModal
-        isOpen={modalTarget !== null}
-        onClose={() => setModalTarget(null)}
-        sideTitle={modalTarget === 'char1' ? 'طرف اول' : 'طرف دوم'}
-        activeCharacterId={modalTarget === 'char1' ? character1.id : character2.id}
-        onSelectCharacter={(selected) => {
-          if (modalTarget === 'char1') setCharacter1(selected);
-          if (modalTarget === 'char2') setCharacter2(selected);
-        }}
+function SideFields({
+  title,
+  side,
+  language,
+  voices,
+  onChange,
+  onPreset,
+}: {
+  title: string;
+  side: Side;
+  language: Language;
+  voices: { id: string; label: string }[];
+  onChange: (side: Side) => void;
+  onPreset: (id: string) => void;
+}) {
+  return (
+    <fieldset className="space-y-3 rounded-lg border border-[#e3dfd8] bg-white p-4">
+      <legend className="px-1 text-sm font-medium">{title}</legend>
+      <select className="field" value="" onChange={(event) => event.target.value && onPreset(event.target.value)}>
+        <option value="">انتخاب آماده</option>
+        {PRESETS.map((preset) => (
+          <option key={preset.id} value={preset.id}>
+            {language === 'fa' ? preset.nameFa : preset.nameEn}
+          </option>
+        ))}
+      </select>
+      <input
+        className="field"
+        dir={language === 'en' ? 'ltr' : 'rtl'}
+        value={side.name}
+        onChange={(event) => onChange({ ...side, name: event.target.value })}
+        placeholder="نام"
       />
-
-      {/* Research & Generation Pipeline Progress Modal */}
-      <ResearchPipelineModal
-        isOpen={isLoading}
-        character1={character1}
-        character2={character2}
-        topic={topic}
+      <textarea
+        className="field min-h-20 leading-7"
+        dir={language === 'en' ? 'ltr' : 'rtl'}
+        value={side.note}
+        onChange={(event) => onChange({ ...side, note: event.target.value })}
+        placeholder="لحن و موضع. اگر خالی باشد از سابقه عمومی استفاده می‌شود."
       />
+      <select className="field" value={side.voiceId} onChange={(event) => onChange({ ...side, voiceId: event.target.value })}>
+        {voices.map((voice) => (
+          <option key={voice.id} value={voice.id}>
+            {voice.label}
+          </option>
+        ))}
+      </select>
+    </fieldset>
+  );
+}
+
+function Dossier({ title, dossier }: { title: string; dossier: ResearchDossier | null }) {
+  if (!dossier) return <p className="text-sm text-[#8a3b2c]">پرونده {title} آماده نیست.</p>;
+  return (
+    <details className="rounded-lg border border-[#e3dfd8] bg-white p-4">
+      <summary className="cursor-pointer text-sm font-medium">پرونده {title}</summary>
+      <div className="mt-3 space-y-3 text-sm leading-7 text-[#3c3832]">
+        <p>{dossier.stance}</p>
+        <List label="ادعاها" items={dossier.coreClaims} />
+        <List label="جایی که ضربه می‌خورد" items={dossier.pressurePoints} />
+        <p className="text-[#5f5a53]">{dossier.method}</p>
+      </div>
+    </details>
+  );
+}
+
+function List({ label, items }: { label: string; items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div>
+      <p className="text-[#8a847b]">{label}</p>
+      <ul className="list-disc ps-5">
+        {items.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
     </div>
   );
+}
+
+function sideFromPreset(id: string, language: Language, engine: EnglishEngine): Side {
+  const preset = PRESETS.find((item) => item.id === id) ?? PRESETS[0];
+  return {
+    name: language === 'fa' ? preset.nameFa : preset.nameEn,
+    note: language === 'fa' ? preset.noteFa : preset.noteEn,
+    voiceId: language === 'fa' ? preset.voiceFa : engine === 'fish-free' ? preset.voiceFree : preset.voiceEn,
+  };
+}
+
+function localizeSide(
+  side: Side,
+  from: Language,
+  to: Language,
+  which: 'a' | 'b',
+  engine: EnglishEngine,
+): Side {
+  const preset = PRESETS.find((item) => (from === 'fa' ? item.nameFa : item.nameEn) === side.name.trim());
+  if (!preset) return withVoice(side, to, which, engine);
+  const previousNote = from === 'fa' ? preset.noteFa : preset.noteEn;
+  return {
+    name: to === 'fa' ? preset.nameFa : preset.nameEn,
+    note: side.note.trim() === previousNote ? (to === 'fa' ? preset.noteFa : preset.noteEn) : side.note,
+    voiceId: to === 'fa' ? preset.voiceFa : engine === 'fish-free' ? preset.voiceFree : preset.voiceEn,
+  };
+}
+
+function withVoice(side: Side, language: Language, which: 'a' | 'b', engine: EnglishEngine): Side {
+  if (isKnownVoice(language, engine, side.voiceId)) return side;
+  return { ...side, voiceId: defaultVoice(language, which, engine) };
+}
+
+function readForm(): { language: Language; engine: EnglishEngine; rounds: number; topic: string; a: Side; b: Side } | null {
+  try {
+    const raw = sessionStorage.getItem(FORM_KEY);
+    return raw ? (JSON.parse(raw) as { language: Language; engine: EnglishEngine; rounds: number; topic: string; a: Side; b: Side }) : null;
+  } catch {
+    return null;
+  }
+}
+
+function messageOf(reason: unknown): string {
+  return reason instanceof Error ? reason.message : '';
 }

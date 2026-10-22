@@ -1,6 +1,5 @@
 {
-  "name": "استودیو مناظره هوشمند | AI Debate Arena",
-  "description": "استودیوی پیشرفته ساخت مناظره صوتی بین شخصیت‌ها با تحقیق خودکار، طراحی پرامپت اختصاصی و صداگذاری هوشمند",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "name": "مناظره",
+  "description": "ابزار شخصی تولید مناظره فارسی و انگلیسی. تحقیق هر طرف جداست و صدا از OpenRouter ساخته می‌شود.",
+  "requestFramePermissions": []
 }

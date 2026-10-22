@@ -1,45 +1,56 @@
 @import "tailwindcss";
 
-@layer base {
-  body {
-    font-family: 'Vazirmatn', 'Noto Sans Arabic', 'Scheherazade New', 'Scheherazade', system-ui, -apple-system, sans-serif;
-  }
+:root {
+  color: #221f1b;
+  background: #f6f5f2;
+  font-family: Vazirmatn, sans-serif;
 }
 
-/* Custom scrollbar for transcript */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+body {
+  margin: 0;
+  min-height: 100vh;
 }
 
-::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
 }
 
-::-webkit-scrollbar-thumb {
-  background: rgba(100, 116, 139, 0.4);
-  border-radius: 9999px;
+.field {
+  width: 100%;
+  border: 1px solid #e3dfd8;
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(148, 163, 184, 0.7);
+.field:focus {
+  outline: 2px solid #221f1b;
+  outline-offset: 1px;
 }
 
-@keyframes pulse-ring {
-  0% {
-    transform: scale(0.95);
-    opacity: 0.8;
-  }
-  50% {
-    transform: scale(1.08);
-    opacity: 0.3;
-  }
-  100% {
-    transform: scale(0.95);
-    opacity: 0.8;
-  }
+.btn {
+  border-radius: 8px;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid #e3dfd8;
+  background: #fff;
+  cursor: pointer;
 }
 
-.animate-pulse-ring {
-  animation: pulse-ring 2s infinite ease-in-out;
+.btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.btn-primary {
+  background: #221f1b;
+  color: #f6f5f2;
+  border-color: #221f1b;
+}
+
+.btn-active {
+  border-color: #221f1b;
 }
